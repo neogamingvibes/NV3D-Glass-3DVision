@@ -40,6 +40,7 @@ if (-not (Test-Path $vswhere)) {
 }
 
 $msbuild = & $vswhere -latest -prerelease `
+    -products * `
     -requires Microsoft.Component.MSBuild `
     -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
 

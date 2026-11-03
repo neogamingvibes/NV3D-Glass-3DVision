@@ -67,7 +67,7 @@ public:
     // entry, because the two operations are independent: leaving "Vsync off"
     // must undo the Fast Sync profile WITHOUT touching a frame cap the user
     // applied to their game, and vice versa.
-    enum class Scope { Self, Game, All };
+    enum class Scope { Self, Game, Stereo, All };
 
     struct Options {
         // Also write VSYNC_BEHAVIOR_FLAGS = IGNORE_FLIPINTERVAL_MULTIPLE.
@@ -81,6 +81,30 @@ public:
     // Apply the recommended profile to NV3D-Glass.exe.
     static Result ApplySelf(const Options& opt, const wchar_t* ini_path,
                             std::wstring* message);
+
+    // Mark NV3D-Glass.exe as a stereo application in its driver profile:
+    // StereoProfile, StereoHiddenProfile and StereoDefaultOn are all set to 1
+    // (the combination 3DVision4All's EnableWindowed3D writes). This is what
+    // makes the driver run its full stereo code for our FSE device instead of
+    // treating it as a plain fullscreen app whose 3D-signature demux it may
+    // disengage on content transitions. Reverted by Revert(Scope::Stereo).
+    static Result ApplyStereoProfile(const wchar_t* ini_path,
+                                      std::wstring* message);
+
+    // Read-only check of the four stereo settings on our own executable's
+    // profile. Returns Result::Ok when the read itself succeeded and stores
+    // whether every value already matches what ApplyStereoProfile writes.
+    // Never writes, never prompts - the launcher uses this on every 3D Vision
+    // start so only a machine that actually needs the setup sees a UAC prompt.
+    static Result CheckStereoProfile(bool* applied, std::wstring* message);
+
+    // Idempotent: applies the stereo profile when it is missing, escalating
+    // through RelaunchElevated when the driver refuses the write without admin
+    // rights. Returns Ok only when the profile is in force afterwards. This is
+    // what the launcher and the companion call so the player never has to run
+    // a profile command by hand.
+    static Result EnsureStereoProfile(const wchar_t* ini_path,
+                                      std::wstring* message);
 
     // Apply "vsync on + cap to fps_cap" to the profile owning game_exe_path.
     // fps_cap should be the panel's stereo rate (half the refresh).

@@ -46,6 +46,11 @@ std::vector<MonitorEntry> EnumerateMonitors();
 // Returns null if not found.
 HWND FindWindowByStableId(const std::wstring& stable_id);
 
+// Find the largest visible, titled top-level window owned by `pid`. Used by
+// the companion mode to capture the game window without a UI picker.
+// Returns false (and leaves *out untouched) if the process has no such window.
+bool FindWindowByPid(DWORD pid, WindowEntry* out);
+
 // Resolve "\\.\DISPLAY1" → HMONITOR. Returns null if not found.
 HMONITOR FindMonitorByDeviceName(const std::wstring& device_name);
 

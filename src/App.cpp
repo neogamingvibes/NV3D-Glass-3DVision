@@ -23,15 +23,18 @@
 #include "CaptureSource.h"
 #include "Gui.h"
 #include "Logging.h"
+#include "NvProfile.h"
 #include "SourceEnumerator.h"
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 
 #include <Windows.h>
+#include <shellapi.h>   // CommandLineToArgvW (companion arguments)
 #include <d3d11.h>
 #include <timeapi.h>   // timeBeginPeriod / timeEndPeriod
 #include <chrono>
+#include <cwchar>      // wcstoul
 #include <thread>
 
 // timeBeginPeriod lives in winmm. Linked here rather than in the project
@@ -123,17 +126,163 @@ void ForceFocusToGame(HWND target) {
 App::App()  = default;
 App::~App() { Shutdown(); }
 
+void App::ParseCompanionArgs() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--companion") {
+            companion_ = true;
+        } else if (a.rfind(L"--owner-pid=", 0) == 0) {
+            companion_owner_pid_ = static_cast<DWORD>(wcstoul(a.c_str() + 12, nullptr, 10));
+        } else if (a.rfind(L"--source-pid=", 0) == 0) {
+            companion_source_pid_ = static_cast<DWORD>(wcstoul(a.c_str() + 13, nullptr, 10));
+        } else if (a.rfind(L"--config=", 0) == 0) {
+            companion_ini_path_ = a.substr(9);
+        } else if (a.rfind(L"--log=", 0) == 0) {
+            companion_log_path_ = a.substr(6);
+        } else if (a == L"--companion-no-switch") {
+            companion_no_switch_ = true;
+        }
+    }
+    LocalFree(argv);
+
+    // Env twin so the GAME-launched companion (which passes a fixed arg
+    // list) can be put into diagnosis mode without touching the game:
+    // set NV3D_COMPANION_NO_SWITCH=1 in the shell that starts the game.
+    if (companion_ && !companion_no_switch_) {
+        wchar_t v[8]{};
+        DWORD n = GetEnvironmentVariableW(L"NV3D_COMPANION_NO_SWITCH", v, _countof(v));
+        if (n > 0 && n < _countof(v) && v[0] != L'0') companion_no_switch_ = true;
+    }
+
+    // Either id can stand in for the other: in our use one game process is
+    // both the window to capture and the lifetime to watch.
+    if (companion_owner_pid_ == 0)  companion_owner_pid_  = companion_source_pid_;
+    if (companion_source_pid_ == 0) companion_source_pid_ = companion_owner_pid_;
+
+    if (companion_) {
+        Log(NV3D::LogLevel::Info,
+            L"App::Init  companion args owner=%lu source=%lu no_switch=%d",
+            static_cast<unsigned long>(companion_owner_pid_),
+            static_cast<unsigned long>(companion_source_pid_),
+            companion_no_switch_ ? 1 : 0);
+    }
+}
+
+bool App::ResolveCompanionSource() {
+    if (companion_source_pid_ == 0) return false;
+    WindowEntry entry;
+    // The game starts us right after its window appears. Retry briefly so a
+    // slow first frame cannot race the capture setup.
+    for (int i = 0; i < 50; ++i) {
+        if (FindWindowByPid(companion_source_pid_, &entry)) {
+            settings_.source_kind = SourceKind::Window;
+            settings_.source_id   = entry.stable_id();
+            Log(NV3D::LogLevel::Info,
+                L"App::Init  companion capturing '%s' (%s) pid=%lu",
+                entry.title.c_str(), entry.process_basename.c_str(),
+                static_cast<unsigned long>(companion_source_pid_));
+            return true;
+        }
+        Sleep(100);
+    }
+    return false;
+}
+
 bool App::Init(HINSTANCE hInstance) {
     hinstance_ = hInstance;
-    ini_path_  = DefaultIniPath();
+    ParseCompanionArgs();
+
+    ini_path_ = companion_ini_path_.empty() ? DefaultIniPath() : companion_ini_path_;
     LoadSettings(settings_, ini_path_.c_str());
-    InitFileLog(DefaultLogPath().c_str());
+    const std::wstring log_path =
+        companion_log_path_.empty() ? DefaultLogPath() : companion_log_path_;
+    InitFileLog(log_path.c_str());
     Log(NV3D::LogLevel::Info,
-        L"App::Init  begin  panel x=%d y=%d w=%d h=%d",
-        settings_.panel_x, settings_.panel_y, settings_.panel_w, settings_.panel_h);
+        L"App::Init  begin  panel x=%d y=%d w=%d h=%d%s",
+        settings_.panel_x, settings_.panel_y, settings_.panel_w, settings_.panel_h,
+        companion_ ? L"  (companion)" : L"");
+
+    if (companion_) {
+        // Make the 3D-Vision force-stereo profile self-installing: a read-only
+        // check on every start, and a ONE-TIME elevated write (UAC) only when
+        // the profile is missing or incomplete. The launcher normally does
+        // this before the game starts; this covers launches that skip the
+        // launcher, and the boot init screen gives the prompt time to appear.
+        std::wstring profile_msg;
+        const NvProfile::Result pr =
+            NvProfile::EnsureStereoProfile(ini_path_.c_str(), &profile_msg);
+        Log(pr == NvProfile::Result::Ok ? NV3D::LogLevel::Info
+                                        : NV3D::LogLevel::Warning,
+            L"App::Init  companion: 3D Vision stereo profile %s (%s)",
+            pr == NvProfile::Result::Ok ? L"ready" : L"NOT ready",
+            profile_msg.c_str());
+    }
 
     if (!CreateControlPanelWindow()) return false;
     if (!renderer_.Init(hwnd_))      return false;
+
+    if (companion_) {
+        // Hidden companion: no panel, no tray icon, no global hotkeys. The
+        // control-panel window still exists (hidden) to own the message queue.
+        panel_visible_ = false;
+
+        if (!ResolveCompanionSource()) {
+            Log(NV3D::LogLevel::Error,
+                L"App::Init  companion: no visible window for pid %lu",
+                static_cast<unsigned long>(companion_source_pid_));
+            return false;
+        }
+        companion_window_source_id_ = settings_.source_id;
+        {
+            WindowEntry game_entry;
+            if (FindWindowByPid(companion_source_pid_, &game_entry)) {
+                RECT cr{};
+                if (GetClientRect(game_entry.hwnd, &cr)) {
+                    companion_test_pattern_w_ = static_cast<UINT>(cr.right - cr.left);
+                    companion_test_pattern_h_ = static_cast<UINT>(cr.bottom - cr.top);
+                }
+            }
+        }
+
+        // Zero-UI defaults: exactly what a manually configured session uses.
+        settings_.enable_lightboost = true;
+        settings_.enable_suppressor = true;
+        // The force-stereo driver profile keeps the session engaged; the
+        // initial activation gets the normal bounded retry budget instead of
+        // the old unbounded keep-alive (pre-profile workaround).
+        settings_.keep_stereo_alive = false;
+        settings_.on_top            = true;
+        settings_.auto_reacquire    = true;
+        settings_.pacing_mode       = PacingMode::PresentClocked;
+        // VsyncOff is deliberately NOT reachable in the companion: unthrottled
+        // presents produced 9-second presents, a dead present worker and a
+        // frozen host (verified 2026-11-03). The regular panel can still pick
+        // it manually; the hidden companion always presents vsync-locked.
+        settings_.output_sync       = OutputSync::VsyncOn;
+        settings_.target_monitor    = nullptr;   // auto-detect the 3DVision display
+        settings_.output_monitor_id.clear();
+        // The capture-idle mitigations were an experiment: they did not stop
+        // the post-switch stereo loss and cost ~40% of the frame rate. The
+        // companion INI persists values from earlier sessions, so force them
+        // off explicitly instead of inheriting whatever was saved.
+        settings_.force_full_capture_hz    = false;
+        settings_.force_capture_hz_postmsg = false;
+
+        if (companion_owner_pid_ != 0) {
+            companion_owner_handle_ = OpenProcess(SYNCHRONIZE, FALSE, companion_owner_pid_);
+        }
+
+        // Start from the first Tick, not here: NVAPI's Stereo_Activate needs a
+        // foreground context owned by THIS process, and the manual UI has that
+        // naturally (the user clicks Start on our panel). Tick runs inside the
+        // message loop, where the brief off-screen activation below can settle.
+        companion_start_pending_ = true;
+        Log(NV3D::LogLevel::Info, L"App::Init  companion ready - starting on first tick");
+        return true;
+    }
 
     gui_ = std::make_unique<Gui>();
     gui_->RefreshSources();
@@ -170,6 +319,10 @@ void App::Shutdown() {
     Log(NV3D::LogLevel::Info, L"App::Shutdown  begin");
     Stop();
     Log(NV3D::LogLevel::Info, L"App::Shutdown  after Stop");
+    if (companion_owner_handle_) {
+        CloseHandle(companion_owner_handle_);
+        companion_owner_handle_ = nullptr;
+    }
     PersistPanelGeometry();
     if (!ini_path_.empty()) SaveSettings(settings_, ini_path_.c_str());
     Log(NV3D::LogLevel::Info, L"App::Shutdown  settings persisted");
@@ -265,15 +418,45 @@ int App::Run() {
     return 0;
 }
 
+void App::ArmCompanionRetry() {
+    if (companion_session_retries_ >= kCompanionMaxSessionRetries) {
+        Log(NV3D::LogLevel::Warning,
+            L"App::Tick  companion: session lost and retry budget exhausted "
+            L"(%d attempts) - staying hidden and idle",
+            companion_session_retries_);
+        return;
+    }
+    ++companion_session_retries_;
+    companion_retry_pending_ = true;
+    // The driver needs ~10 s to reclaim the display after a scene-change hang;
+    // starting the rebuild after 1 s (instead of 5) saves four seconds of the
+    // user staring at SBS. Later attempts back off exponentially so a driver
+    // that stays wedged is not hammered with LightBoost modesets.
+    int backoff_s = 1;
+    for (int i = 1; i < companion_session_retries_ && backoff_s < 10; ++i) {
+        backoff_s *= 2;
+    }
+    if (backoff_s > 10) backoff_s = 10;
+    companion_retry_at_ = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(backoff_s);
+    // The deferred start goes straight to the window capture again (no test
+    // pattern warmup to re-arm).
+    Log(NV3D::LogLevel::Info,
+        L"App::Tick  companion: session lost - auto-retry %d/%d in %ds",
+        companion_session_retries_, kCompanionMaxSessionRetries, backoff_s);
+}
+
 void App::AccumulatePacingStats(bool captured, bool presented) {
-    // Opt-in: this is a measurement tool for frame-pacing work, not
-    // something a normal session should be writing to the log every second.
-    static const bool pacing_on = []() {
+    // Opt-in via NV3D_GLASS_PACING=1 (manual panel and companion alike): the
+    // 1 Hz line carries captures/presents, lib accepted/dropped/done and the
+    // live driver IsActivated state for support diagnostics. The stall/device
+    // and retry warnings are separate and always on.
+    static const bool pacing_env = []() {
         wchar_t v[8]{};
         DWORD n = GetEnvironmentVariableW(L"NV3D_GLASS_PACING", v, _countof(v));
         return n > 0 && n < _countof(v) && v[0] != L'0';
     }();
-    if (!pacing_on) return;
+    if (!pacing_env) return;
 
     const auto now = std::chrono::steady_clock::now();
     if (last_tick_ts_.time_since_epoch().count() != 0) {
@@ -297,6 +480,20 @@ void App::AccumulatePacingStats(bool captured, bool presented) {
     if (window_s < 1.0) return;
     pacing_window_t0_ = now;
 
+    // Idle window (no session): counters all zero — nothing worth a log
+    // line, just reset. A session that captured AND presented nothing for a
+    // full second WOULD land here too; that total-starvation state also
+    // logs through the producer-gap warning in Tick, so it stays visible.
+    if (pacing_captures_ == 0 && pacing_presents_ == 0) {
+        pacing_ticks_       = 0;
+        pacing_captures_    = 0;
+        pacing_presents_    = 0;
+        pacing_tick_ms_sum_ = 0.0;
+        pacing_tick_ms_min_ = 0.0;
+        pacing_tick_ms_max_ = 0.0;
+        return;
+    }
+
     // NV3DLib's side of the story: how many submits it took, how many it had
     // to drop because the worker was still busy, and how long a completed
     // present actually takes. drop>0 in present-clocked mode means the gate
@@ -304,17 +501,31 @@ void App::AccumulatePacingStats(bool captured, bool presented) {
     NV3D::PresentStats ps{};
     presenter_.GetPresentStats(&ps);
 
+    // Correlation anchors for the stereo keep-alive question: who owns the
+    // foreground, which source feeds staging right now, and the live
+    // handle-path driver state (NOT the demux — see IsStereoActivated).
+    DWORD fg_pid = 0;
+    if (HWND fg = GetForegroundWindow()) {
+        GetWindowThreadProcessId(fg, &fg_pid);
+    }
+    const wchar_t* src_name =
+        settings_.source_kind == SourceKind::None     ? L"testpattern" :
+        settings_.source_kind == SourceKind::Window   ? L"window" :
+        settings_.source_kind == SourceKind::Monitor  ? L"monitor" : L"katanga";
+
     Log(NV3D::LogLevel::Info,
         L"App::Pacing  mode=%s tick(min/avg/max)=%.1f/%.1f/%.1f ms  "
-        L"ticks=%u captures=%u submits=%u  lib(accepted=%u dropped=%u done=%u "
-        L"present_avg=%.1f present_max=%.1f ms)  fps=%.1f",
+        L"ticks=%u captures=%u presents=%u  lib(accepted=%u dropped=%u done=%u "
+        L"present_avg=%.1f present_max=%.1f ms)  fps=%.1f  stereo=%s fgpid=%lu src=%s",
         settings_.pacing_mode == PacingMode::Legacy ? L"legacy" : L"present-clocked",
         pacing_tick_ms_min_,
         pacing_ticks_ ? pacing_tick_ms_sum_ / pacing_ticks_ : 0.0,
         pacing_tick_ms_max_,
         pacing_ticks_, pacing_captures_, pacing_presents_,
         ps.submits_accepted, ps.submits_dropped, ps.presents_done,
-        ps.present_ms_avg, ps.present_ms_max, fps_);
+        ps.present_ms_avg, ps.present_ms_max, fps_,
+        presenter_.IsStereoActivated() ? L"on" : L"OFF",
+        static_cast<unsigned long>(fg_pid), src_name);
 
     pacing_ticks_       = 0;
     pacing_captures_    = 0;
@@ -450,6 +661,15 @@ HWND App::ResolveCaptureTarget(SourceKind* out_kind, HWND* out_hwnd, HMONITOR* o
     if (out_hwnd) *out_hwnd = nullptr;
     if (out_hmon) *out_hmon = nullptr;
     if (settings_.source_kind == SourceKind::Window) {
+        // Companion: resolve by process id every time (title changes and
+        // auto-reacquire both keep working without a stale stable_id).
+        if (companion_ && companion_source_pid_ != 0) {
+            WindowEntry w;
+            if (FindWindowByPid(companion_source_pid_, &w)) {
+                if (out_hwnd) *out_hwnd = w.hwnd;
+                return w.hwnd;
+            }
+        }
         HWND h = FindWindowByStableId(settings_.source_id);
         if (out_hwnd) *out_hwnd = h;
         return h;
@@ -554,7 +774,14 @@ bool App::Start() {
     // (output_monitor × 2) lets the scaler handle every source size - both
     // mid-session producer-side resolution changes and upscale-when-smaller —
     // without ever resizing the staging texture or restarting the presenter.
-    if (staging_w == 0 || staging_h == 0) {
+    if (companion_ && kind == SourceKind::None &&
+        companion_test_pattern_w_ > 0 && companion_test_pattern_h_ > 0) {
+        // No-switch diagnostic test pattern: use the SAME staging size as the
+        // window capture. A size change would rebuild the staging/shared views,
+        // cause GPU stalls and make the driver drop stereo (verified in the log).
+        staging_w = companion_test_pattern_w_;
+        staging_h = companion_test_pattern_h_;
+    } else if (staging_w == 0 || staging_h == 0) {
         // Test-pattern mode (no cap_), DXGI fallback (no Initial* getter), or
         // Katanga waiting (producer hasn't published yet). Size the staging
         // to the output monitor's resolution × 2 in width - that matches the
@@ -655,7 +882,7 @@ bool App::Start() {
     // in another process and we don't know which one), and HidePanel'ing
     // ourselves while waiting for a producer would just disappear the only UI
     // the user has.
-    if (kind != SourceKind::None && kind != SourceKind::Katanga) {
+    if (!companion_ && kind != SourceKind::None && kind != SourceKind::Katanga) {
         HWND game_hwnd = src_hwnd;
         if (!game_hwnd && tracked_pid != 0 && tracked_pid != GetCurrentProcessId()) {
             struct Ctx { DWORD pid; HWND result; } ctx{ tracked_pid, nullptr };
@@ -687,7 +914,10 @@ bool App::Start() {
         tracked_pid_ = tracked_pid;
         StartForceFocusWatcher(tracked_pid_);
     } else {
-        tracked_pid_ = 0;
+        // Companion: the game already owns the foreground, and touching the
+        // hidden control panel (HidePanel) would create a taskbar button.
+        // Keep the pid so NV3DLib's popup lifecycle still follows the game.
+        tracked_pid_ = (kind == SourceKind::Window) ? tracked_pid : 0;
     }
 
     return true;
@@ -695,9 +925,10 @@ bool App::Start() {
 
 void App::Stop() {
     Log(NV3D::LogLevel::Info,
-        L"App::Stop  cap_=%p presenter.IsActive=%s state=%d",
+        L"App::Stop  cap_=%p presenter.session=%s stereo_activated=%s state=%d",
         (void*)cap_.get(),
         presenter_.IsActive() ? L"true" : L"false",
+        presenter_.IsStereoActivated() ? L"true" : L"false",
         (int)state_);
     ReleaseCursorClip();
     StopForceFocusWatcher();
@@ -774,7 +1005,7 @@ void App::HidePanel() {
 
 void App::ToggleFseVisible() {
     Log(NV3D::LogLevel::Info,
-        L"App::ToggleFseVisible  state=%d fse_visible_=%d presenter.IsActive=%s",
+        L"App::ToggleFseVisible  state=%d fse_visible_=%d presenter.session=%s",
         (int)state_, (int)fse_visible_,
         presenter_.IsActive() ? L"true" : L"false");
     // Mirrors VRto3D's Ctrl+F8 → flip is_on_top_/man_on_top_ pattern. We just
@@ -1231,6 +1462,99 @@ int App::StereoRateHz() const {
 }
 
 void App::Tick() {
+    // Companion lifetime: the game process owns us. When it exits (normally,
+    // by crash, or by the task manager) the handle signals and we tear down
+    // cleanly instead of leaving an invisible capture/presenter running.
+    if (companion_ && companion_owner_handle_ != nullptr &&
+        WaitForSingleObject(companion_owner_handle_, 0) == WAIT_OBJECT_0) {
+        Log(NV3D::LogLevel::Info,
+            L"App::Tick  companion: owner process exited - quitting");
+        Quit();
+        return;
+    }
+
+    // Deferred companion start. NVAPI returns IsActivated=false when the
+    // calling process is not foreground, and the manual UI only ever starts a
+    // session while its own panel is foreground. Give the process the same
+    // context without showing anything: a WS_EX_TOOLWINDOW panel parked far
+    // off-screen, activated for the duration of Start(), then hidden and the
+    // focus handed back to the game.
+    // Session-loss auto-retry: fire the re-armed deferred start once the
+    // backoff elapsed (see ArmCompanionRetry).
+    if (companion_ && companion_retry_pending_ &&
+        std::chrono::steady_clock::now() >= companion_retry_at_) {
+        companion_retry_pending_ = false;
+        companion_start_pending_ = true;
+        Log(NV3D::LogLevel::Info,
+            L"App::Tick  companion: retrying session after session loss");
+    }
+    if (companion_ && companion_start_pending_) {
+        companion_start_pending_ = false;
+        Log(NV3D::LogLevel::Info,
+            L"App::Tick  companion: starting capture/presenter (heartbeat=%dms, no_switch=%d)",
+            []() { wchar_t v[16]{};
+                   const DWORD n = GetEnvironmentVariableW(
+                       L"NV3D_COMPANION_HEARTBEAT_MS", v, _countof(v));
+                   return (n > 0 && n < _countof(v)) ? _wtoi(v) : 100; }(),
+            companion_no_switch_ ? 1 : 0);
+        // Transparent activation context: a visible top-level window of this
+        // process owns the foreground (what NVAPI needs), but alpha 0 means the
+        // user sees nothing. The real activation input is sent later, after the
+        // presenter has actually been running for a moment.
+        LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
+        SetWindowPos(hwnd_, nullptr, 0, 0, 480, 600,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ShowWindow(hwnd_, SW_SHOW);
+        SetForegroundWindow(hwnd_);
+        Log(NV3D::LogLevel::Info, L"App::Tick  companion foreground=%s",
+            GetForegroundWindow() == hwnd_ ? L"yes" : L"no");
+        MSG msg;
+        for (int i = 0; i < 5; ++i) {
+            Sleep(10);
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        // Start DIRECTLY on the window capture. The boot init screen now has a
+        // real 3D backdrop (the rotating NVG logo), so the driver gets a
+        // genuine stereo activation context from the first frame; the old
+        // internal-test-pattern warmup + in-session switch (and its stalls) is
+        // no longer needed. The --companion-no-switch diagnostic keeps the
+        // test pattern for driver-isolation runs.
+        if (companion_no_switch_) {
+            settings_.source_kind = SourceKind::None;
+            settings_.source_id.clear();
+        } else {
+            settings_.source_kind = SourceKind::Window;
+            settings_.source_id = companion_window_source_id_;
+        }
+        const bool started = Start();
+        ShowWindow(hwnd_, SW_HIDE);
+        if (!started) {
+            Log(NV3D::LogLevel::Error, L"App::Tick  companion: Start failed");
+            Quit();
+            return;
+        }
+        // Give the captured game the foreground itself: the driver's stereo
+        // activation follows the focused stereo application. The force-stereo
+        // profile makes this sufficient without synthetic key/mouse input.
+        WindowEntry game;
+        if (FindWindowByPid(companion_source_pid_, &game)) {
+            ForceFocusToGame(game.hwnd);
+            Log(NV3D::LogLevel::Info, L"App::Tick  companion running (game foreground=%s)",
+                GetForegroundWindow() == game.hwnd ? L"yes" : L"no");
+        } else {
+            Log(NV3D::LogLevel::Info, L"App::Tick  companion running (game window gone)");
+        }
+        if (companion_no_switch_) {
+            Log(NV3D::LogLevel::Info,
+                L"App::Tick  companion: no-switch mode - keeping the test pattern");
+        }
+    }
+
     // Pacing diagnostics for this tick - did we actually pull a new source
     // frame, and did we hand one to the presenter. Both stay false on the
     // many ticks that are pure housekeeping.
@@ -1260,6 +1584,8 @@ void App::Tick() {
             if (renderer_.RecreateDevice()) {
                 state_ = AppState::Idle;
                 status_extra_ = L"GPU reset recovered - click Start to retry";
+                // Hidden companion has no user to click Start — re-arm.
+                if (companion_) ArmCompanionRetry();
             }
         }
     }
@@ -1686,7 +2012,28 @@ void App::Tick() {
         // 30fps source. That competition starved the source of GPU time so
         // it couldn't hit 30fps, which read as "slow motion" downstream.
         const auto now = std::chrono::steady_clock::now();
-        const bool heartbeat_due = (now - last_present_ts_) >= std::chrono::milliseconds(250);
+        // Companion: re-present more often while the source is idle (menus,
+        // pause). Each present also runs NV3DLib's stereo-activation retry, so
+        // the driver's stereo state is re-asserted ~10x/s instead of ~4x/s.
+        // NV3D_COMPANION_HEARTBEAT_MS (1..1000) tightens this for diagnosis:
+        // e.g. 16 forces ~60 presents/s of the SAME staging content during a
+        // frozen pause menu — if stereo then survives the pause, the driver
+        // needs a present CADENCE (H7); if it still drops, the CONTENT is
+        // what the driver evaluates (H3 disparity / H8 motion).
+        static const int companion_hb_ms = []() {
+            wchar_t v[16]{};
+            const DWORD n = GetEnvironmentVariableW(
+                L"NV3D_COMPANION_HEARTBEAT_MS", v, _countof(v));
+            if (n > 0 && n < _countof(v)) {
+                const int ms = _wtoi(v);
+                if (ms > 0 && ms <= 1000) return ms;
+            }
+            return 100;
+        }();
+        const auto heartbeat_period = companion_
+            ? std::chrono::milliseconds(companion_hb_ms)
+            : std::chrono::milliseconds(250);
+        const bool heartbeat_due = (now - last_present_ts_) >= heartbeat_period;
         // slot_open also gates the heartbeat: submitting to a busy worker is
         // exactly the stall-or-drop we are eliminating, and the heartbeat
         // only exists to keep the driver's stereo alive during a quiet
@@ -1713,6 +2060,8 @@ void App::Tick() {
                 if (renderer_.RecreateDevice()) {
                     state_ = AppState::Idle;
                     status_extra_ = L"GPU TDR recovered - click Start to retry";
+                    // Hidden companion has no user to click Start — re-arm.
+                    if (companion_) ArmCompanionRetry();
                 }
             } else {
                 const HRESULT phr = presenter_.SubmitFrame(renderer_.Staging());
@@ -1748,9 +2097,21 @@ void App::Tick() {
                             }
                         } else {
                             Stop();
-                            ShowPanel();
-                            state_ = AppState::SourceLost;
-                            status_extra_ = L"3D output device hung - click Start to retry";
+                            if (companion_) {
+                                // Hidden helper: a popped-up panel would steal
+                                // foreground + input from the game. Re-arm a
+                                // bounded auto-retry instead (Run 2026-11-03:
+                                // this exact path left the companion in
+                                // SourceLost with a visible panel while the
+                                // game kept running).
+                                ArmCompanionRetry();
+                                state_ = AppState::SourceLost;
+                                status_extra_ = L"3D output device hung - companion retry armed";
+                            } else {
+                                ShowPanel();
+                                state_ = AppState::SourceLost;
+                                status_extra_ = L"3D output device hung - click Start to retry";
+                            }
                         }
                     }
                 } else {
@@ -1759,17 +2120,17 @@ void App::Tick() {
             }
         }
 
-        // Diagnostic periodic device-state ping. Gated on NV3D_GLASS_D3D11_DEBUG=1
-        // so normal users don't get spam. Helps spot a slow device degradation
-        // (partial removal, increasing per-frame latency) before the explicit
-        // TDR-detection paths fire - by then the device is already gone.
+        // Diagnostic periodic device-state ping. Opt-in via
+        // NV3D_GLASS_D3D11_DEBUG=1: it was invaluable while chasing the
+        // scene-change stalls, but in normal play it only writes ~4 log lines
+        // per second and grows the file for no user-visible benefit. The
+        // stall/dead-device warnings are separate and always on.
         if (++diag_periodic_counter_ >= 30) {
             diag_periodic_counter_ = 0;
             static const bool diag_on = []() {
                 wchar_t v[8]{};
                 DWORD n = GetEnvironmentVariableW(L"NV3D_GLASS_D3D11_DEBUG", v, _countof(v));
-                // ON by default; only "0" disables.
-                return !(n > 0 && n < _countof(v) && v[0] == L'0');
+                return n > 0 && n < _countof(v) && v[0] == L'1';
             }();
             if (diag_on && renderer_.Device()) {
                 HRESULT rmv = renderer_.Device()->GetDeviceRemovedReason();

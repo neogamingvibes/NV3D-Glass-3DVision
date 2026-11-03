@@ -68,6 +68,12 @@ struct Settings {
     bool         on_top            = true;
     bool         enable_lightboost = true;
     bool         enable_suppressor = true;
+    // Companion-only runtime flag (not persisted): keep retrying
+    // NvAPI_Stereo_Activate for the whole session instead of the normal ~3s
+    // budget. NV3DLib's demo drops back to mono when the source goes static
+    // (2D menu, paused game), and the driver's stereo state is what needs
+    // re-asserting after those idle periods.
+    bool         keep_stereo_alive = false;
 
     // Swap-chain presentation interval. Device-creation parameter - changing
     // it needs a Stop/Start.

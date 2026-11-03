@@ -4,6 +4,38 @@ Capture a side-by-side stereo source (game, video player, Katanga producer) and
 re-present it as true frame-sequential **NVIDIA 3D Vision** output via
 NV3DLib. No DLL injection into the captured app; runs as a standalone .exe with an ImGui control panel.
 
+## 3D Vision improvements in this fork (2026-11-03)
+
+This fork carries the 3D Vision integration work from our upcoming game:
+
+- **Force-stereo driver profile.** `--apply-nvprofile stereo` writes the minimal
+  `StereoProfile=1` key for `NV3D-Glass.exe`; `ensure-stereo` checks it
+  idempotently and elevates only when the driver refuses the write. It keeps
+  the driver's stereo path engaged across menus, pause screens and levels
+  instead of dropping to SBS on content changes.
+- **Stall-tolerant presenter.** Fence timeouts query
+  `ID3D11Device::GetDeviceRemovedReason()` and skip the frame instead of
+  tearing down the FSE session; only a real removal rebuilds it. Companion
+  session retries are bounded with a short exponential backoff.
+- **Correct WGC client crop.** Anchored on
+  `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` instead of
+  `GetWindowRect`, fixing the few-pixel shift / coloured edge on windowed
+  Win10 apps.
+- **Companion mode.** Starts directly on the window capture (no test-pattern
+  warmup/switch), bounded keep-alive retries, 1 Hz Pacing and D3D11 diag logs
+  are opt-in (`NV3D_GLASS_PACING=1`, `NV3D_GLASS_D3D11_DEBUG=1`), and VsyncOff
+  is locked out (it could wedge the driver in this setup).
+
+**NV3D-Lib patches.** The stall/device handling changes live in the
+`external/NV3D-Lib` submodule. After `git submodule update --init --recursive`,
+apply the included patch from the repository root:
+
+```
+git -C external/NV3D-Lib apply ../../patches/nv3d-lib-3dvision.patch
+```
+
+Then build as described below.
+
 ## Requirements
 
 - Windows 10 1903+ / Windows 11 (WGC capture)

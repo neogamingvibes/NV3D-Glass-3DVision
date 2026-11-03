@@ -46,7 +46,18 @@ constexpr const wchar_t* kBackupSection = L"NvProfileBackup";
 constexpr const wchar_t* kCmdFlag   = L"--apply-nvprofile";
 constexpr const wchar_t* kCmdSelf   = L"self";
 constexpr const wchar_t* kCmdGame   = L"game";
+constexpr const wchar_t* kCmdStereo = L"stereo";
+constexpr const wchar_t* kCmdEnsureStereo = L"ensure-stereo";
 constexpr const wchar_t* kCmdRevert = L"revert";
+
+// Undocumented 3D Vision profile settings (not present in NVIDIA's public
+// Undocumented 3D Vision profile setting (not in NVIDIA's public
+// NvApiDriverSettings.h; ID/meaning from Bo3b's Driver Profile Settings wiki).
+// StereoProfile alone is the bisection candidate: it marks the app as a stereo
+// application and makes the driver run its stereo code. The extra keys used
+// earlier (StereoHiddenProfile, StereoDefaultOn, EnableStereoCursor) are being
+// tested for removal — this build writes only StereoProfile.
+constexpr NvU32 kStereoProfileId       = 0x701EB457;  // STEREO_STEREOPROFILE
 
 static_assert(sizeof(wchar_t) == sizeof(NvU16),
               "NvAPI_UnicodeString is UTF-16; this code memcpy's wchar_t into it");
@@ -108,14 +119,19 @@ struct BackupEntry {
 // selector meaning "every tag" - so it has no entry here; ScopeName() is the
 // one to use for logging.
 const wchar_t* ScopeTag(NvProfile::Scope s) {
-    return s == NvProfile::Scope::Game ? L"game" : L"self";
+    switch (s) {
+        case NvProfile::Scope::Game:   return L"game";
+        case NvProfile::Scope::Stereo: return L"stereo";
+        default:                       return L"self";
+    }
 }
 
 const wchar_t* ScopeName(NvProfile::Scope s) {
     switch (s) {
-        case NvProfile::Scope::Game: return L"game";
-        case NvProfile::Scope::Self: return L"self";
-        default:                     return L"all";
+        case NvProfile::Scope::Game:   return L"game";
+        case NvProfile::Scope::Self:   return L"self";
+        case NvProfile::Scope::Stereo: return L"stereo";
+        default:                       return L"all";
     }
 }
 
@@ -325,6 +341,7 @@ void InspectSettings(NvDRSSessionHandle h, NvDRSProfileHandle prof,
     static const NvU32 ids[] = {
         VSYNCMODE_ID, PRERENDERLIMIT_ID, PREFERRED_PSTATE_ID,
         VSYNC_BEHAVIOR_FLAGS_ID, FRL_FPS_ID,
+        kStereoProfileId,
     };
     Log(NV3D::LogLevel::Info, L"NvProfile: inspecting profile '%s'", prof_name.c_str());
     for (NvU32 id : ids) {
@@ -357,7 +374,8 @@ NvAPI_Status WriteSetting(NvDRSSessionHandle h, NvDRSProfileHandle prof,
         Log(NV3D::LogLevel::Warning,
             L"NvProfile: SetSetting(0x%08X = %u) failed code=%d%s",
             id, value, (int)st,
-            st == NVAPI_ACCESS_DENIED ? L" (needs elevation)" : L"");
+            (st == NVAPI_ACCESS_DENIED || st == NVAPI_INVALID_USER_PRIVILEGE)
+                ? L" (needs elevation)" : L"");
     }
     return st;
 }
@@ -441,7 +459,11 @@ NvProfile::Result MapOpenFailure(NvAPI_Status st, std::wstring* message) {
 }
 
 NvProfile::Result MapSaveFailure(NvAPI_Status st, std::wstring* message) {
-    if (st == NVAPI_ACCESS_DENIED) {
+    // The stereo block returns NVAPI_INVALID_USER_PRIVILEGE (-137, "the
+    // application will require Administrator privileges") on this driver,
+    // while other settings can return NVAPI_ACCESS_DENIED (-175). Both mean
+    // "elevate and retry", not "broken".
+    if (st == NVAPI_ACCESS_DENIED || st == NVAPI_INVALID_USER_PRIVILEGE) {
         if (message) {
             *message = L"saving driver settings needs administrator rights";
         }
@@ -605,6 +627,201 @@ NvProfile::Result NvProfile::ApplySelf(const Options& opt, const wchar_t* ini_pa
     return Result::Ok;
 }
 
+NvProfile::Result NvProfile::ApplyStereoProfile(const wchar_t* ini_path,
+                                                std::wstring* message) {
+    DrsSession sess;
+    if (const NvAPI_Status st = sess.Open(); st != NVAPI_OK) {
+        return MapOpenFailure(st, message);
+    }
+
+    const std::wstring exe = BaseName(SelfExePath().c_str());
+    if (exe.empty()) {
+        if (message) *message = L"could not determine our own executable name";
+        return Result::Failed;
+    }
+
+    // Same rule as the other scopes: write into whatever profile our exe
+    // already belongs to; only create the NV3D-Glass profile when it has none.
+    NvDRSProfileHandle prof = nullptr;
+    std::wstring created_profile, created_app;
+    {
+        NvAPI_UnicodeString app_name{};
+        ToNvStr(app_name, exe.c_str());
+        NVDRS_APPLICATION app{};
+        app.version = NVDRS_APPLICATION_VER;
+        if (NvAPI_DRS_FindApplicationByName(sess.get(), app_name, &prof, &app) != NVAPI_OK) {
+            prof = nullptr;
+        }
+    }
+    if (!prof) {
+        NvAPI_UnicodeString pname{};
+        ToNvStr(pname, kSelfProfileName);
+        if (NvAPI_DRS_FindProfileByName(sess.get(), pname, &prof) != NVAPI_OK) {
+            NVDRS_PROFILE pi{};
+            pi.version = NVDRS_PROFILE_VER;
+            ToNvStr(pi.profileName, kSelfProfileName);
+            if (NvAPI_DRS_CreateProfile(sess.get(), &pi, &prof) != NVAPI_OK || !prof) {
+                if (message) *message = L"could not create the NV3D-Glass driver profile";
+                return Result::Failed;
+            }
+            created_profile = kSelfProfileName;
+        }
+        NVDRS_APPLICATION app{};
+        app.version      = NVDRS_APPLICATION_VER;
+        app.isPredefined = 0;
+        ToNvStr(app.appName,          exe.c_str());
+        ToNvStr(app.userFriendlyName, L"NV3D-Glass");
+        if (NvAPI_DRS_CreateApplication(sess.get(), prof, &app) == NVAPI_OK) {
+            created_app = exe;
+        }
+    }
+
+    const std::wstring prof_name = ProfileName(sess.get(), prof);
+    const std::vector<std::pair<NvU32, NvU32>> settings = {
+        { kStereoProfileId,       1u },
+    };
+
+    int unparsed = 0;
+    std::vector<BackupEntry> backup = LoadBackup(ini_path, &unparsed);
+    if (unparsed > 0) {
+        if (message) {
+            *message = L"the undo record is unreadable - revert or remove the "
+                       L"[NvProfileBackup] section before applying again";
+        }
+        return Result::Failed;
+    }
+
+    const std::wstring tag = ScopeTag(NvProfile::Scope::Stereo);
+    if (const NvAPI_Status st = ApplyRecorded(sess.get(), prof, prof_name, tag, exe,
+                                              settings, backup);
+        st != NVAPI_OK) {
+        SaveBackup(backup, tag, created_profile, created_app, ini_path);
+        sess.Save();
+        return MapSaveFailure(st, message);
+    }
+
+    if (const NvAPI_Status st = sess.Save(); st != NVAPI_OK) {
+        return MapSaveFailure(st, message);
+    }
+    SaveBackup(backup, tag, created_profile, created_app, ini_path);
+
+    Log(NV3D::LogLevel::Info,
+        L"NvProfile: marked '%s' as a stereo application in profile '%s' "
+        L"(StereoProfile=1)",
+        exe.c_str(), prof_name.c_str());
+    if (message) {
+        *message = L"Marked '" + exe + L"' as a stereo application (profile '" +
+                   prof_name + L"'). Start the companion afterwards; revert "
+                   L"with \"--apply-nvprofile revert stereo\".";
+    }
+    return Result::Ok;
+}
+
+
+NvProfile::Result NvProfile::CheckStereoProfile(bool* applied, std::wstring* message) {
+    if (applied) *applied = false;
+
+    DrsSession sess;
+    if (const NvAPI_Status st = sess.Open(); st != NVAPI_OK) {
+        return MapOpenFailure(st, message);
+    }
+
+    const std::wstring exe = BaseName(SelfExePath().c_str());
+    if (exe.empty()) {
+        if (message) *message = L"could not determine our own executable name";
+        return Result::Failed;
+    }
+
+    NvDRSProfileHandle prof = nullptr;
+    {
+        NvAPI_UnicodeString app_name{};
+        ToNvStr(app_name, exe.c_str());
+        NVDRS_APPLICATION app{};
+        app.version = NVDRS_APPLICATION_VER;
+        if (NvAPI_DRS_FindApplicationByName(sess.get(), app_name, &prof, &app) != NVAPI_OK) {
+            prof = nullptr;
+        }
+    }
+    if (!prof) {
+        if (message) *message = L"no driver profile for '" + exe + L"' yet";
+        return Result::Ok;   // not applied, but not an error
+    }
+
+    const std::pair<NvU32, NvU32> wanted[] = {
+        { kStereoProfileId,       1u },
+    };
+    bool all = true;
+    for (const auto& kv : wanted) {
+        bool had = false;
+        NvU32 value = 0;
+        if (!ReadSetting(sess.get(), prof, kv.first, &had, &value) ||
+            !had || value != kv.second) {
+            all = false;
+        }
+    }
+
+    if (applied) *applied = all;
+    if (message) {
+        *message = all ? L"3D Vision stereo profile already applied"
+                       : L"3D Vision stereo profile missing or incomplete";
+    }
+    return Result::Ok;
+}
+
+NvProfile::Result NvProfile::EnsureStereoProfile(const wchar_t* ini_path,
+                                                 std::wstring* message) {
+    bool applied = false;
+    std::wstring msg;
+    Result r = CheckStereoProfile(&applied, &msg);
+    if (r != Result::Ok) {
+        if (message) *message = msg;
+        return r;
+    }
+    if (applied) {
+        if (message) *message = msg;
+        return Result::Ok;
+    }
+
+    // First try in-process: some machines allow the stereo block without
+    // elevation, and an already-elevated caller can write it directly.
+    r = ApplyStereoProfile(ini_path, &msg);
+    if (r == Result::Ok) {
+        if (message) *message = msg;
+        return Result::Ok;
+    }
+    if (r != Result::NeedsElevation) {
+        if (message) *message = msg;
+        return r;
+    }
+    if (IsElevated()) {
+        if (message) *message = msg;   // elevated and the driver still refused
+        return r;
+    }
+
+    // One-time UAC. The child applies the profile and records the undo in the
+    // same INI the caller uses, so a later revert stays consistent.
+    wchar_t args[2048]{};
+    _snwprintf_s(args, _TRUNCATE, L"%s %s --config=\"%s\"",
+                 kCmdFlag, kCmdStereo, ini_path ? ini_path : L"");
+    if (!RelaunchElevated(args, &msg)) {
+        if (message) *message = msg;
+        return Result::NeedsElevation;
+    }
+
+    bool now = false;
+    std::wstring check_msg;
+    if (CheckStereoProfile(&now, &check_msg) == Result::Ok && now) {
+        if (message) *message = L"3D Vision stereo profile applied (elevated)";
+        return Result::Ok;
+    }
+    if (message) {
+        *message = L"the elevated helper ran but the stereo profile did not "
+                   L"take effect: " + check_msg;
+    }
+    return Result::Failed;
+}
+
+
 NvProfile::Result NvProfile::ApplyGame(const wchar_t* game_exe_path, int fps_cap,
                                        const wchar_t* ini_path, std::wstring* message) {
     const std::wstring exe = BaseName(game_exe_path);
@@ -728,7 +945,7 @@ NvProfile::Result NvProfile::Revert(Scope scope, const wchar_t* ini_path,
     // Created-object markers are per scope for the same reason.
     struct CreatedRec { std::wstring tag, profile, app; };
     std::vector<CreatedRec> created;
-    for (const wchar_t* tag : { L"self", L"game" }) {
+    for (const wchar_t* tag : { L"self", L"game", L"stereo" }) {
         if (!ScopeMatches(scope, tag)) continue;
         // Narrowing to one executable leaves the scope's other entries in
         // place, so anything the scope created is still in use - only a
@@ -817,7 +1034,7 @@ NvProfile::Result NvProfile::Revert(Scope scope, const wchar_t* ini_path,
     // with it, so snapshot those first and stamp them back afterwards.
     struct SurvivingCreated { std::wstring tag, profile, app; };
     std::vector<SurvivingCreated> survivors;
-    for (const wchar_t* tag : { L"self", L"game" }) {
+    for (const wchar_t* tag : { L"self", L"game", L"stereo" }) {
         if (ScopeMatches(scope, tag)) continue;   // this scope is being reverted
         SurvivingCreated sc;
         sc.tag     = tag;
@@ -859,7 +1076,7 @@ bool NvProfile::HasBackup(Scope scope, const wchar_t* ini_path, const wchar_t* e
         if (EntryMatches(scope, exe, e)) return true;
     }
     if (exe && *exe) return false;   // created markers are not per executable
-    for (const wchar_t* tag : { L"self", L"game" }) {
+    for (const wchar_t* tag : { L"self", L"game", L"stereo" }) {
         if (!ScopeMatches(scope, tag)) continue;
         if (!IniGet(CreatedProfileKey(tag).c_str(), L"", ini_path).empty()) return true;
         if (!IniGet(CreatedAppKey(tag).c_str(),     L"", ini_path).empty()) return true;
@@ -984,6 +1201,10 @@ bool NvProfile::RunCommandLine(const wchar_t* command_line, const wchar_t* ini_p
         opt.experimental_flip_interval =
             (i + 2 < argc) && _wcsicmp(argv[i + 2], L"flip") == 0;
         r = ApplySelf(opt, ini_path, &msg);
+    } else if (_wcsicmp(verb, kCmdStereo) == 0) {
+        r = ApplyStereoProfile(ini_path, &msg);
+    } else if (_wcsicmp(verb, kCmdEnsureStereo) == 0) {
+        r = EnsureStereoProfile(ini_path, &msg);
     } else if (_wcsicmp(verb, kCmdGame) == 0 && i + 3 < argc) {
         const int cap = _wtoi(argv[i + 2]);
         r = ApplyGame(argv[i + 3], cap, ini_path, &msg);
@@ -993,6 +1214,7 @@ bool NvProfile::RunCommandLine(const wchar_t* command_line, const wchar_t* ini_p
         if (i + 2 < argc) {
             if      (_wcsicmp(argv[i + 2], L"self") == 0) scope = Scope::Self;
             else if (_wcsicmp(argv[i + 2], L"game") == 0) scope = Scope::Game;
+            else if (_wcsicmp(argv[i + 2], L"stereo") == 0) scope = Scope::Stereo;
         }
         // Optional 4th argument narrows a game revert to one executable.
         const wchar_t* rexe = (i + 3 < argc) ? argv[i + 3] : nullptr;

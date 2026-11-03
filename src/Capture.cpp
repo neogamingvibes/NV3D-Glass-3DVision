@@ -21,6 +21,7 @@
 
 #include <Windows.h>
 #include <d3d11.h>
+#include <dwmapi.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
@@ -155,11 +156,29 @@ std::unique_ptr<CaptureWGC> CaptureWGC::CreateForWindow(ID3D11Device* dev, HWND 
 
     // Compute the client area's position within the captured frame so callers
     // can crop out the title bar / borders / DWM shadow at staging-write time.
-    // WGC captures the FULL window as DWM sees it (including the shadow on
-    // Win10+), so we anchor on the window's outer rect and find the client
-    // origin in screen space relative to that.
+    // WGC captures the VISIBLE window as DWM sees it. GetWindowRect is NOT a
+    // reliable anchor for that: on Windows 10 it also includes the invisible
+    // resize border (several pixels on every side), so the computed client
+    // origin lands too far right/down. The crop then cuts content off the left
+    // and pulls the window border (often the accent colour) in on the right -
+    // the few-pixel shift / coloured edge seen with the regular NV3D-Glass too.
+    // Anchor on DWMWA_EXTENDED_FRAME_BOUNDS instead, which matches WGC.
     RECT outer{};
-    if (GetWindowRect(hwnd, &outer)) {
+    bool have_outer = false;
+    RECT window_rect{};
+    const bool have_window_rect = GetWindowRect(hwnd, &window_rect) != 0;
+    RECT dwm_bounds{};
+    const HRESULT dwm_hr = DwmGetWindowAttribute(
+        hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &dwm_bounds, sizeof(dwm_bounds));
+    if (SUCCEEDED(dwm_hr) &&
+        dwm_bounds.right > dwm_bounds.left && dwm_bounds.bottom > dwm_bounds.top) {
+        outer = dwm_bounds;
+        have_outer = true;
+    } else if (have_window_rect) {
+        outer = window_rect;
+        have_outer = true;
+    }
+    if (have_outer) {
         RECT cr{};
         POINT client_origin{ 0, 0 };
         if (GetClientRect(hwnd, &cr) && ClientToScreen(hwnd, &client_origin)) {
@@ -169,8 +188,8 @@ std::unique_ptr<CaptureWGC> CaptureWGC::CreateForWindow(ID3D11Device* dev, HWND 
             const LONG ch = cr.bottom - cr.top;
             const LONG fw = out->impl_->size.Width;
             const LONG fh = out->impl_->size.Height;
-            // Clamp into the captured frame in case WGC's size and
-            // GetWindowRect disagree (they can by a pixel or two).
+            // Clamp into the captured frame in case WGC's size and the DWM
+            // bounds disagree (they can by a pixel or two).
             const LONG l = (ox < 0) ? 0 : (ox > fw ? fw : ox);
             const LONG t = (oy < 0) ? 0 : (oy > fh ? fh : oy);
             const LONG r = ((ox + cw) > fw) ? fw : (ox + cw);
@@ -178,6 +197,19 @@ std::unique_ptr<CaptureWGC> CaptureWGC::CreateForWindow(ID3D11Device* dev, HWND 
             if (r > l && b > t) {
                 out->impl_->client_area = RECT{ l, t, r, b };
             }
+            Log(NV3D::LogLevel::Info,
+                L"CaptureWGC: frame=%ldx%ld window=(%ld,%ld)-(%ld,%ld) "
+                L"dwm(hr=0x%08X)=(%ld,%ld)-(%ld,%ld) client_screen=(%ld,%ld) "
+                L"client=%ldx%ld -> capture=(%ld,%ld)-(%ld,%ld) [%ldx%ld]",
+                fw, fh,
+                have_window_rect ? window_rect.left : 0,
+                have_window_rect ? window_rect.top : 0,
+                have_window_rect ? window_rect.right : 0,
+                have_window_rect ? window_rect.bottom : 0,
+                (unsigned)dwm_hr,
+                dwm_bounds.left, dwm_bounds.top, dwm_bounds.right, dwm_bounds.bottom,
+                client_origin.x, client_origin.y, cw, ch,
+                l, t, r, b, r - l, b - t);
         }
     }
     return out;

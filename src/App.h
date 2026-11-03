@@ -177,6 +177,46 @@ private:
     // Self-gates on state / WGC-or-Katanga source / fse_visible_.
     void   DriveIdleCaptureHz();
 
+    // ---- Companion mode (--companion) ----
+    // Hidden, auto-started instance launched by the game. Parses its own
+    // command line, forces the capture/output defaults, starts immediately and
+    // quits when the owning game process exits. No panel, tray icon or global
+    // hotkeys.
+    void   ParseCompanionArgs();
+    bool   ResolveCompanionSource();
+    void   CheckCompanionOwner();
+    bool                               companion_ = false;
+    bool                               companion_start_pending_ = false;
+    std::wstring                       companion_window_source_id_;
+    UINT                               companion_test_pattern_w_ = 0;
+    UINT                               companion_test_pattern_h_ = 0;
+    DWORD                              companion_owner_pid_  = 0;
+    DWORD                              companion_source_pid_ = 0;
+    HANDLE                             companion_owner_handle_ = nullptr;
+    std::wstring                       companion_ini_path_;
+    std::wstring                       companion_log_path_;
+    // --companion-no-switch / NV3D_COMPANION_NO_SWITCH: keep the internal
+    // test pattern forever, never switch to the window capture. Diagnosis
+    // mode — a 5-minute run with stereo alive on the test pattern proves
+    // the drop needs the switch/WGC side (present gap, first WGC frame),
+    // while a drop after ~20-30s without any switch pins the driver's
+    // revalidation timer instead.
+    bool                               companion_no_switch_ = false;
+    // Session-loss handling for the hidden companion: it must never pop a
+    // visible panel (that steals foreground/input from the game), and there
+    // is no user to click Start in SourceLost — so re-arm the deferred start
+    // (full alpha-panel foreground dance + test-pattern warmup + switch).
+    // The budget is generous because a scene change in the host can hang the
+    // legacy stereo driver and cost ~20 s of recoverable downtime; giving up
+    // after three tries left the user with a dead companion for the rest of
+    // the session (seen 2026-11-03). The exponential backoff (1/2/4/8/10 s)
+    // still keeps a permanently wedged driver from hammering LightBoost.
+    static constexpr int kCompanionMaxSessionRetries = 20;
+    int                                companion_session_retries_ = 0;
+    bool                               companion_retry_pending_ = false;
+    std::chrono::steady_clock::time_point companion_retry_at_{};
+    void ArmCompanionRetry();
+
     static LRESULT CALLBACK StaticWndProc(HWND, UINT, WPARAM, LPARAM);
 
     HINSTANCE                          hinstance_     = nullptr;

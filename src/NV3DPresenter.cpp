@@ -80,7 +80,7 @@ bool NV3DPresenter::Init(ID3D11Device* dev, const Settings& s, DWORD tracked_gam
     p.enable_lightboost       = s.enable_lightboost;
     p.enable_suppressor       = s.enable_suppressor;
     p.host_hwnd               = nullptr;   // library-owned FSE click-through window
-    p.activation_retry_budget = 60;
+    p.activation_retry_budget = s.keep_stereo_alive ? -1 : 60;
     p.tracked_game_pid        = tracked_game_pid;
     p.present_interval        = (s.output_sync == OutputSync::VsyncOff)
                                    ? NV3D::PresentInterval::VsyncOff
@@ -111,7 +111,9 @@ bool NV3DPresenter::Init(ID3D11Device* dev, const Settings& s, DWORD tracked_gam
 
     DiagnoseClickThrough();
     Log(NV3D::LogLevel::Info,
-        L"NV3DPresenter: Init complete  iface=%p IsActive=true", (void*)iface_);
+        L"NV3DPresenter: Init complete  iface=%p session=up (stereo state is "
+        L"NOT queried here - see IsStereoActivated / the 1Hz App::Pacing line)",
+        (void*)iface_);
 
     last_tex_ = nullptr;
     return true;
@@ -154,6 +156,11 @@ void NV3DPresenter::GetPresentStats(NV3D::PresentStats* out) const {
     if (!out) return;
     if (!iface_) { *out = NV3D::PresentStats{}; return; }
     iface_->GetPresentStats(out);
+}
+
+bool NV3DPresenter::IsStereoActivated() const {
+    if (!iface_) return false;
+    return iface_->IsStereoActivated();
 }
 
 void NV3DPresenter::SetVisible(bool visible) {

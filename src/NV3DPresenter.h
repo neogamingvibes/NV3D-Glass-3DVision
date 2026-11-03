@@ -77,6 +77,12 @@ public:
 
     bool IsActive() const { return iface_ != nullptr; }
 
+    // Live NvAPI IsActivated state of the driver's stereo handle (path A).
+    // NOT the NV3D-signature demux and NOT "session exists" — false with the
+    // NVCP toggle off even while the picture is 3D. Diagnostics only, e.g.
+    // the 1Hz companion status line.
+    bool IsStereoActivated() const;
+
     // NV3DLib's "present worker is idle" event — SET between presents, RESET
     // while one is in flight. Null when no session is up. App::Run waits on
     // this to clock the capture/submit loop off the 3D panel instead of a

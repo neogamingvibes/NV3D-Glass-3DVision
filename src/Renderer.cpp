@@ -128,6 +128,10 @@ bool Renderer::Init(HWND control_panel_hwnd) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    // The companion persists its panel geometry in nv3d-companion.ini; ImGui's
+    // own imgui.ini only ever contained the unused Debug window and was written
+    // into the working directory (the game/release folder) as a stray file.
+    io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
 

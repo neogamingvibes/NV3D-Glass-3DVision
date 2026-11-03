@@ -50,7 +50,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         // likely running and holding that one open exclusively, and
         // InitFileLog truncates. A separate file means the helper's
         // diagnostics survive and the parent's log is untouched.
-        const std::wstring ini = nv3dg::DefaultIniPath();
+        // The parent may pass the game-provided INI (--config=...) so the undo
+        // record for an automatically applied stereo profile lives in the same
+        // file the companion uses later.
+        std::wstring ini = nv3dg::DefaultIniPath();
+        if (const wchar_t* p = wcsstr(GetCommandLineW(), L"--config=")) {
+            std::wstring path(p + wcslen(L"--config="));
+            if (!path.empty() && path.front() == L'"') path.erase(path.begin());
+            const size_t quote = path.find(L'"');
+            if (quote != std::wstring::npos) {
+                path.resize(quote);
+            } else {
+                const size_t space = path.find(L' ');
+                if (space != std::wstring::npos) path.resize(space);
+            }
+            if (!path.empty()) ini = path;
+        }
         std::wstring helper_log = nv3dg::DefaultLogPath();
         const size_t dot = helper_log.find_last_of(L'.');
         helper_log = (dot == std::wstring::npos ? helper_log : helper_log.substr(0, dot)) +

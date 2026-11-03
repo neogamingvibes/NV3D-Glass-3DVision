@@ -21,6 +21,7 @@
 #include <Psapi.h>
 #include <Shlwapi.h>
 #include <cstdio>
+#include <utility>
 
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Shlwapi.lib")
@@ -66,6 +67,32 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lp) {
     e.title = title;
     e.process_basename = ProcessBasenameForHwnd(hwnd);
     list->push_back(std::move(e));
+    return TRUE;
+}
+
+struct PidEnumState {
+    DWORD                     pid  = 0;
+    std::vector<WindowEntry>* list = nullptr;
+};
+
+BOOL CALLBACK EnumPidProc(HWND hwnd, LPARAM lp) {
+    auto* st = reinterpret_cast<PidEnumState*>(lp);
+    DWORD wpid = 0;
+    GetWindowThreadProcessId(hwnd, &wpid);
+    if (wpid != st->pid)                  return TRUE;
+    if (!IsWindowVisible(hwnd))           return TRUE;
+    if (GetWindowTextLengthW(hwnd) <= 0)  return TRUE;
+    LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if (ex & WS_EX_TOOLWINDOW)            return TRUE;
+    int len = GetWindowTextLengthW(hwnd);
+    std::wstring title(len + 1, L'\0');
+    GetWindowTextW(hwnd, title.data(), len + 1);
+    title.resize(wcslen(title.c_str()));
+    WindowEntry e;
+    e.hwnd  = hwnd;
+    e.title = std::move(title);
+    e.process_basename = ProcessBasenameForHwnd(hwnd);
+    st->list->push_back(std::move(e));
     return TRUE;
 }
 
@@ -123,6 +150,33 @@ HWND FindWindowByStableId(const std::wstring& stable_id) {
         if (e.stable_id() == stable_id) return e.hwnd;
     }
     return nullptr;
+}
+
+bool FindWindowByPid(DWORD pid, WindowEntry* out) {
+    if (!out || pid == 0) return false;
+    std::vector<WindowEntry> windows;
+    PidEnumState st{ pid, &windows };
+    EnumWindows(EnumPidProc, reinterpret_cast<LPARAM>(&st));
+    if (windows.empty()) return false;
+
+    // A process can own more than one top-level window (splash screens,
+    // tool windows). The game's main window is the largest one.
+    auto area = [](HWND h) -> long long {
+        RECT r{};
+        if (!GetWindowRect(h, &r)) return 0;
+        return static_cast<long long>(r.right - r.left) * (r.bottom - r.top);
+    };
+    WindowEntry* best = &windows.front();
+    long long best_area = area(best->hwnd);
+    for (auto& w : windows) {
+        const long long a = area(w.hwnd);
+        if (a > best_area) {
+            best = &w;
+            best_area = a;
+        }
+    }
+    *out = *best;
+    return true;
 }
 
 HMONITOR FindMonitorByDeviceName(const std::wstring& device_name) {

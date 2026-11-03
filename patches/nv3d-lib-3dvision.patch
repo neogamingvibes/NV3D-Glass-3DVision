@@ -1,0 +1,316 @@
+diff --git a/NV3DLib/include/NV3D.hpp b/NV3DLib/include/NV3D.hpp
+index c995d03..01e9117 100644
+--- a/NV3DLib/include/NV3D.hpp
++++ b/NV3DLib/include/NV3D.hpp
+@@ -257,6 +257,13 @@ public:
+     // Drain the present-path counters (see PresentStats). Resets on read.
+     virtual void GetPresentStats(PresentStats* out) = 0;
+ 
++    // Live NvAPI_Stereo_IsActivated query on the D3D9 stereo handle — the
++    // handle-gated driver flag (path A), NOT the NV3D-signature demux. false
++    // also when no handle exists (NVCP stereo off → CreateHandle -144): in
++    // that state the signature demux can still route the halves, so treat
++    // this as a diagnostic for 1Hz status logs, never as output truth.
++    virtual bool IsStereoActivated() = 0;
++
+ protected:
+     ~InterfaceDX11() = default;
+ };
+diff --git a/NV3DLib/src/backends/dx11_backend.cpp b/NV3DLib/src/backends/dx11_backend.cpp
+index b6ffe8a..a459d57 100644
+--- a/NV3DLib/src/backends/dx11_backend.cpp
++++ b/NV3DLib/src/backends/dx11_backend.cpp
+@@ -17,8 +17,24 @@ bool IsBgra(DXGI_FORMAT f) {
+     return f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+ }
+ 
++// A scene load can keep the GPU busy for seconds (shader compilation, level
++// uploads) — exactly when the legacy stereo driver stalls. Waiting longer on
++// the WORKER costs the host nothing: Submit() is bounded to ~8 ms and simply
++// drops frames while the worker is busy. Declaring the device dead after
++// 500 ms used to tear down a perfectly healthy FSE session on every level
++// change, leaving the player with ~20 s of companion downtime.
++constexpr DWORD kFenceWaitMs = 2000;
++
+ }  // anonymous
+ 
++// Authoritative device-loss check, used before any timeout is treated as a
++// dead device. S_OK means the device is still alive and the timeout was a
++// transient GPU stall we should ride out.
++HRESULT DX11Backend::DeviceRemovedReason() {
++    if (!host_device_) return S_OK;
++    return host_device_->GetDeviceRemovedReason();
++}
++
+ HRESULT DX11Backend::Init(ID3D11Device* device, const InitParams& params) {
+     if (!device) return E_POINTER;
+     params_ = params;
+@@ -221,7 +237,8 @@ HRESULT DX11Backend::WaitForDx11Writes() {
+     }
+     host_ctx_->End(sync_query_.Get());
+     host_ctx_->Flush();
+-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
++    const auto deadline = std::chrono::steady_clock::now() +
++                          std::chrono::milliseconds(kFenceWaitMs);
+     BOOL done = FALSE;
+     while (true) {
+         HRESULT hr = host_ctx_->GetData(sync_query_.Get(), &done, sizeof(done), 0);
+@@ -235,9 +252,16 @@ HRESULT DX11Backend::WaitForDx11Writes() {
+             return hr;
+         }
+         if (std::chrono::steady_clock::now() >= deadline) {
+-            NV3D_LOG_ERROR(L"DX11Backend: sync_query timed out (>500ms) — GPU wedged?");
+-            if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "sync_query timeout");
+-            return E_FAIL;
++            const HRESULT reason = DeviceRemovedReason();
++            NV3D_LOG_ERROR(L"DX11Backend: sync_query timed out (>%lums) — device reason 0x%08X",
++                           static_cast<unsigned long>(kFenceWaitMs), reason);
++            if (FAILED(reason)) {
++                if (presenter_) presenter_->CheckAndMarkD3D9Dead(reason, "sync_query timeout");
++                return reason;
++            }
++            // Healthy device: this was a scene-load stall, not a loss. Skip
++            // the frame and keep the FSE session alive.
++            return S_OK;
+         }
+         std::this_thread::yield();
+     }
+@@ -274,21 +298,31 @@ HRESULT DX11Backend::Present() {
+         const uint64_t signal_value = ++fence_value_;
+         HRESULT shr = host_ctx4_->Signal(fence_.Get(), signal_value);
+         if (FAILED(shr)) {
+-            NV3D_LOG_ERROR(L"DX11Backend: ID3D11DeviceContext4::Signal failed hr=0x%08X", shr);
+-            if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "fence signal");
+-            return shr;
++            const HRESULT reason = DeviceRemovedReason();
++            NV3D_LOG_ERROR(L"DX11Backend: ID3D11DeviceContext4::Signal failed hr=0x%08X (device reason 0x%08X)",
++                           shr, reason);
++            if (FAILED(reason)) {
++                if (presenter_) presenter_->CheckAndMarkD3D9Dead(reason, "fence signal");
++                return reason;
++            }
++            return S_OK;   // device healthy: skip this frame, keep the session
+         }
+         host_ctx_->Flush();  // make sure the signal reaches the GPU promptly
+ 
+         return async_.Submit([this, signal_value, snap_sfc, snap_w, snap_h]() -> HRESULT {
+             HRESULT hr = fence_->SetEventOnCompletion(signal_value, fence_event_);
+             if (FAILED(hr)) {
+-                NV3D_LOG_ERROR(L"DX11Backend: SetEventOnCompletion failed hr=0x%08X", hr);
+-                if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "SetEventOnCompletion");
+-                return hr;
++                const HRESULT reason = DeviceRemovedReason();
++                NV3D_LOG_ERROR(L"DX11Backend: SetEventOnCompletion failed hr=0x%08X (device reason 0x%08X)",
++                               hr, reason);
++                if (FAILED(reason)) {
++                    if (presenter_) presenter_->CheckAndMarkD3D9Dead(reason, "SetEventOnCompletion");
++                    return reason;
++                }
++                return S_OK;   // device healthy: skip this frame
+             }
+             const DWORD wait_t0 = GetTickCount();
+-            DWORD wait = WaitForSingleObject(fence_event_, 500);
++            DWORD wait = WaitForSingleObject(fence_event_, kFenceWaitMs);
+             const DWORD wait_ms = GetTickCount() - wait_t0;
+             // GPU-stall probe: normal fence waits at 90-120fps are 0-10ms.
+             // A spike here means the GPU itself stalled — if the host's log
+@@ -301,9 +335,21 @@ HRESULT DX11Backend::Present() {
+                               static_cast<unsigned long>(wait_ms));
+             }
+             if (wait == WAIT_TIMEOUT) {
+-                NV3D_LOG_ERROR(L"DX11Backend: fence event timeout (>500ms) — GPU wedged?");
+-                if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "fence wait timeout");
+-                return E_FAIL;
++                // A timeout alone is not a dead device: query the driver's
++                // real removal reason first. Scene loads regularly stall the
++                // GPU for longer than the old 500 ms window; tearing down the
++                // FSE session for that was the scene-change "hang" the player
++                // saw (2026-11-03).
++                const HRESULT reason = DeviceRemovedReason();
++                if (FAILED(reason)) {
++                    NV3D_LOG_ERROR(L"DX11Backend: fence wait timed out after %lums — device removed hr=0x%08X",
++                                   static_cast<unsigned long>(wait_ms), reason);
++                    if (presenter_) presenter_->CheckAndMarkD3D9Dead(reason, "fence wait timeout");
++                    return reason;
++                }
++                NV3D_LOG_WARN(L"DX11Backend: fence wait stalled %lums — frame skipped, device healthy",
++                              static_cast<unsigned long>(wait_ms));
++                return S_OK;
+             }
+             if (wait != WAIT_OBJECT_0) {
+                 NV3D_LOG_ERROR(L"DX11Backend: WaitForSingleObject(fence_event) failed result=%lu err=%lu",
+@@ -336,6 +382,12 @@ void DX11Backend::GetPresentStats(PresentStats* out) {
+                      &out->present_ms_max);
+ }
+ 
++bool DX11Backend::IsStereoActivated() {
++    // No handle (NVCP stereo off) → false by contract; the NV3D signature
++    // demux may still route the halves, see NV3D.hpp.
++    return presenter_ && presenter_->IsStereoActivated();
++}
++
+ void DX11Backend::SetVisible(bool visible) {
+     if (!visible) {
+         // Hide = the window thread will SW_MINIMIZE the FSE popup within
+diff --git a/NV3DLib/src/backends/dx11_backend.h b/NV3DLib/src/backends/dx11_backend.h
+index ebbd277..ef1260f 100644
+--- a/NV3DLib/src/backends/dx11_backend.h
++++ b/NV3DLib/src/backends/dx11_backend.h
+@@ -42,6 +42,7 @@ public:
+     void    Delete() override;
+     HANDLE  GetPresentCompletedEvent() const override;
+     void    GetPresentStats(PresentStats* out) override;
++    bool    IsStereoActivated() override;
+ 
+ private:
+     bool EnsureSharedImport(ID3D11Texture2D* sbs);
+@@ -49,6 +50,13 @@ private:
+     bool EnsureSyncQuery();
+     HRESULT WaitForDx11Writes();
+ 
++    // Real device-loss probe. A fence wait that times out is NOT proof the
++    // device is gone: loading a new scene can keep the GPU busy for seconds
++    // (shader compilation, uploads), which is exactly when the legacy stereo
++    // driver stalls. Ask D3D11 for the authoritative removal reason instead
++    // of hard-coding D3DERR_DEVICEHUNG for every timeout.
++    HRESULT DeviceRemovedReason();
++
+     // Fence path: when supported, replaces the EVENT-query GetData spin with
+     // an ID3D11Fence + Win32 event so the wait moves entirely to the async
+     // worker. Returns true on systems with D3D11.4 (ID3D11Device5).
+diff --git a/NV3DLib/src/d3d9_presenter.cpp b/NV3DLib/src/d3d9_presenter.cpp
+index 05fda5c..31bc9f6 100644
+--- a/NV3DLib/src/d3d9_presenter.cpp
++++ b/NV3DLib/src/d3d9_presenter.cpp
+@@ -278,10 +278,15 @@ bool D3D9Presenter::BuildD3D9Stack() {
+         NvU8 enabled = 0;
+         NvAPI_Status s = NvAPI_Stereo_IsEnabled(&enabled);
+         if (s != NVAPI_OK || !enabled) {
+-            NV3D_LOG_ERROR(L"3D Vision is not enabled in NVCP — enable 'Set up stereoscopic 3D' "
+-                            L"in NVIDIA Control Panel. NvAPI_Stereo_IsEnabled status=%d enabled=%d",
+-                            static_cast<int>(s), enabled);
+-            return false;
++            // NOT fatal. The AUTOMATIC path demuxes via the NV3D signature row
++            // written into the packed surface, not via the NVCP global switch:
++            // the driver's signature scanner still routes the halves when the
++            // control-panel toggle is off. Forcing a hard failure here made the
++            // companion refuse to start for users who (correctly) turned that
++            // legacy toggle off. Keep it as a diagnostic only.
++            NV3D_LOG_WARN(L"3D Vision is disabled in NVCP (NvAPI_Stereo_IsEnabled "
++                          L"status=%d enabled=%d) — continuing on the NV3D signature path",
++                          static_cast<int>(s), enabled);
+         }
+     }
+     NV3D_LOG_INFO(L"D3D9Presenter: stereo driver mode = AUTOMATIC (NV3D signature)");
+@@ -453,29 +458,29 @@ bool D3D9Presenter::BuildD3D9Stack() {
+ 
+     NvAPI_Status s = NvAPI_Stereo_CreateHandleFromIUnknown(device9_.Get(), &stereo_handle_);
+     if (s != NVAPI_OK || !stereo_handle_) {
+-        NV3D_LOG_ERROR(L"NvAPI_Stereo_CreateHandleFromIUnknown failed code=%d", static_cast<int>(s));
+-        return false;
+-    }
+-    // Leave surface-creation mode at the driver default (AUTO). FORCESTEREO
+-    // is a DIRECT-mode leftover — with the NV3D signature scanner active,
+-    // the packed RT is a mono source that the driver demuxes at PresentEx.
+-    // Force-stereoizing it makes the packed RT itself a stereo pair, which
+-    // doubles per-frame driver allocations / copies and puts the scanner in
+-    // an untested corner (mono-demux-from-stereo-source). Not required for
+-    // AUTOMATIC + signature.
+-
+-    s = NvAPI_Stereo_Activate(stereo_handle_);
+-    {
+-        NvU8 active = 0;
+-        NvAPI_Stereo_IsActivated(stereo_handle_, &active);
+-        stereo_activated_ = (active != 0);
+-        float sep = 0.0f, conv = 0.0f;
+-        NvAPI_Stereo_GetSeparation(stereo_handle_, &sep);
+-        NvAPI_Stereo_GetConvergence(stereo_handle_, &conv);
+-        NV3D_LOG_INFO(L"NvAPI_Stereo_Activate code=%d IsActivated=%s sep=%.2f conv=%.2f",
+-                       static_cast<int>(s),
+-                       stereo_activated_ ? L"yes" : L"no (retry scheduled)",
+-                       sep, conv);
++        // The legacy NVCP "Set up stereoscopic 3D" switch gates NvAPI's stereo
++        // handle creation (a disabled system returns e.g. -144). The AUTOMATIC
++        // path does not need the handle: the driver scans the NV3D signature
++        // row at PresentEx and routes the halves itself. Continue presenting
++        // without a handle; every other NvAPI stereo call is guarded on it.
++        NV3D_LOG_WARN(L"NvAPI_Stereo_CreateHandleFromIUnknown failed code=%d — "
++                       L"continuing without a stereo handle (NV3D signature path)",
++                       static_cast<int>(s));
++        stereo_handle_ = nullptr;
++    } else {
++        s = NvAPI_Stereo_Activate(stereo_handle_);
++        {
++            NvU8 active = 0;
++            NvAPI_Stereo_IsActivated(stereo_handle_, &active);
++            stereo_activated_ = (active != 0);
++            float sep = 0.0f, conv = 0.0f;
++            NvAPI_Stereo_GetSeparation(stereo_handle_, &sep);
++            NvAPI_Stereo_GetConvergence(stereo_handle_, &conv);
++            NV3D_LOG_INFO(L"NvAPI_Stereo_Activate code=%d IsActivated=%s sep=%.2f conv=%.2f",
++                           static_cast<int>(s),
++                           stereo_activated_ ? L"yes" : L"no (retry scheduled)",
++                           sep, conv);
++        }
+     }
+ 
+     // Cap queued frames at 1. During the driver's ~20-30s stereo revalidation
+@@ -661,6 +666,13 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
+     return S_OK;
+ }
+ 
++bool D3D9Presenter::IsStereoActivated() const {
++    if (!stereo_handle_) return false;
++    NvU8 active = 0;
++    if (NvAPI_Stereo_IsActivated(stereo_handle_, &active) != NVAPI_OK) return false;
++    return active != 0;
++}
++
+ void D3D9Presenter::StereoHealthProbe() {
+     if (!stereo_handle_ || !stereo_activated_) return;
+     const DWORD now = GetTickCount();
+@@ -674,6 +686,13 @@ void D3D9Presenter::StereoHealthProbe() {
+         if (!is_active) {
+             NV3D_LOG_WARN(L"D3D9Presenter: stereo health — IsActivated flipped FALSE "
+                           L"(driver stereo revalidation / state loss in progress)");
++            // Re-arm the activation retry so the presenter engages stereo
++            // again instead of staying in SBS until the next user input.
++            // Without this the driver can drop us permanently after a source
++            // or staging change.
++            stereo_activated_ = false;
++            activation_retries_left_ = INT_MAX;
++            activation_summary_logged_ = false;
+         } else {
+             NV3D_LOG_INFO(L"D3D9Presenter: stereo health — IsActivated recovered to TRUE");
+         }
+diff --git a/NV3DLib/src/d3d9_presenter.h b/NV3DLib/src/d3d9_presenter.h
+index 23eca19..f964188 100644
+--- a/NV3DLib/src/d3d9_presenter.h
++++ b/NV3DLib/src/d3d9_presenter.h
+@@ -79,6 +79,14 @@ public:
+     IDirect3DDevice9Ex* Device() const { return device9_.Get(); }
+     StereoHandle        StereoHandleOpaque() const { return stereo_handle_; }
+ 
++    // Fresh NvAPI_Stereo_IsActivated read (not the cached stereo_activated_
++    // flag — the health probe stops polling once it flips false, so a cached
++    // read could never observe a recovery). Live query so a 1Hz status log
++    // sees the true driver state every second. Thread: any thread that can
++    // already call NvAPI (BuildD3DStack calls Activate from the host thread,
++    // the health probe from the present worker — same pattern).
++    bool IsStereoActivated() const;
++
+ private:
+     bool BuildD3D9Stack();
+     void StereoActivationRetry();
+diff --git a/tools/build.ps1 b/tools/build.ps1
+index 912f992..1cae3c5 100644
+--- a/tools/build.ps1
++++ b/tools/build.ps1
+@@ -43,6 +43,7 @@ if (-not (Test-Path $vswhere)) {
+ }
+ 
+ $msbuild = & $vswhere -latest -prerelease `
++    -products * `
+     -requires Microsoft.Component.MSBuild `
+     -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+ 
