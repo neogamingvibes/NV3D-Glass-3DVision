@@ -179,10 +179,36 @@ index ebbd277..ef1260f 100644
      // an ID3D11Fence + Win32 event so the wait moves entirely to the async
      // worker. Returns true on systems with D3D11.4 (ID3D11Device5).
 diff --git a/NV3DLib/src/d3d9_presenter.cpp b/NV3DLib/src/d3d9_presenter.cpp
-index 05fda5c..31bc9f6 100644
+index 05fda5c..292836b 100644
 --- a/NV3DLib/src/d3d9_presenter.cpp
 +++ b/NV3DLib/src/d3d9_presenter.cpp
-@@ -278,10 +278,15 @@ bool D3D9Presenter::BuildD3D9Stack() {
+@@ -192,6 +192,25 @@ void D3D9Presenter::Shutdown() {
+     //    never complete. NvAPI cleans up on Unload anyway.
+     if (stereo_handle_) {
+         if (!dead) {
++            // Explicitly leave stereo mode before destroying the handle.
++            // DestroyHandle alone can leave the legacy 3D Vision display
++            // timing engaged after the last stereo app exits. This call is
++            // the documented "stereo is turned off" path for the device
++            // interface; on drivers that still keep the display in 3D after
++            // process exit (a known legacy-driver limitation, also seen with
++            // official 3D Vision games) it is harmless.
++            const DWORD td = GetTickCount();
++            const NvAPI_Status deact = NvAPI_Stereo_Deactivate(stereo_handle_);
++            const DWORD dms = GetTickCount() - td;
++            if (deact == NVAPI_OK) {
++                NV3D_LOG_INFO(L"D3D9Presenter::Shutdown: Stereo_Deactivate ok (%lums)",
++                              static_cast<unsigned long>(dms));
++            } else {
++                NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: Stereo_Deactivate code=%d (%lums)",
++                              static_cast<int>(deact),
++                              static_cast<unsigned long>(dms));
++            }
++
+             const DWORD t0 = GetTickCount();
+             NvAPI_Stereo_DestroyHandle(stereo_handle_);
+             const DWORD ms = GetTickCount() - t0;
+@@ -278,10 +297,15 @@ bool D3D9Presenter::BuildD3D9Stack() {
          NvU8 enabled = 0;
          NvAPI_Status s = NvAPI_Stereo_IsEnabled(&enabled);
          if (s != NVAPI_OK || !enabled) {
@@ -202,7 +228,7 @@ index 05fda5c..31bc9f6 100644
          }
      }
      NV3D_LOG_INFO(L"D3D9Presenter: stereo driver mode = AUTOMATIC (NV3D signature)");
-@@ -453,29 +458,29 @@ bool D3D9Presenter::BuildD3D9Stack() {
+@@ -453,29 +477,29 @@ bool D3D9Presenter::BuildD3D9Stack() {
  
      NvAPI_Status s = NvAPI_Stereo_CreateHandleFromIUnknown(device9_.Get(), &stereo_handle_);
      if (s != NVAPI_OK || !stereo_handle_) {
@@ -255,7 +281,7 @@ index 05fda5c..31bc9f6 100644
      }
  
      // Cap queued frames at 1. During the driver's ~20-30s stereo revalidation
-@@ -661,6 +666,13 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
+@@ -661,6 +685,13 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
      return S_OK;
  }
  
@@ -269,7 +295,7 @@ index 05fda5c..31bc9f6 100644
  void D3D9Presenter::StereoHealthProbe() {
      if (!stereo_handle_ || !stereo_activated_) return;
      const DWORD now = GetTickCount();
-@@ -674,6 +686,13 @@ void D3D9Presenter::StereoHealthProbe() {
+@@ -674,6 +705,13 @@ void D3D9Presenter::StereoHealthProbe() {
          if (!is_active) {
              NV3D_LOG_WARN(L"D3D9Presenter: stereo health — IsActivated flipped FALSE "
                            L"(driver stereo revalidation / state loss in progress)");

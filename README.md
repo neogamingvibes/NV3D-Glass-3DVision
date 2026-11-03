@@ -25,6 +25,11 @@ This fork carries the 3D Vision integration work from our upcoming game:
   warmup/switch), bounded keep-alive retries, 1 Hz Pacing and D3D11 diag logs
   are opt-in (`NV3D_GLASS_PACING=1`, `NV3D_GLASS_D3D11_DEBUG=1`), and VsyncOff
   is locked out (it could wedge the driver in this setup).
+- **Explicit stereo off on teardown.** Shutdown calls
+  `NvAPI_Stereo_Deactivate` before destroying the stereo handle, the
+  documented way to leave stereo mode. Some legacy drivers still keep the
+  display in 3D after the process exits (also seen with official 3D Vision
+  games); the call is harmless there.
 
 **NV3D-Lib patches.** The stall/device handling changes live in the
 `external/NV3D-Lib` submodule. After `git submodule update --init --recursive`,
