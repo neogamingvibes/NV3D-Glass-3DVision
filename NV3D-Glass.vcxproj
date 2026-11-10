@@ -124,6 +124,12 @@
     <ClInclude Include="src\TrayIcon.h" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Windows VERSIONINFO: company/product/description/version/copyright.
+         Without it the exe's Details tab is empty and anonymous binaries
+         score worse with AV reputation heuristics. -->
+    <ResourceCompile Include="src\version.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClCompile Include="external\imgui\imgui.cpp" />
     <ClCompile Include="external\imgui\imgui_draw.cpp" />
     <ClCompile Include="external\imgui\imgui_tables.cpp" />
